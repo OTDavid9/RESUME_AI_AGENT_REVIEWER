@@ -1,1 +1,5 @@
 venv/
+
+gemini_pro.py
+
+.env

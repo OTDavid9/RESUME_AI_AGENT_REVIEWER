@@ -3,14 +3,19 @@ import os
 from google import genai
 from google.genai import types
 from typing import List, Dict
-import textract
+import io
 from dotenv import load_dotenv
-import io # Needed for handling uploaded file bytes
-import tempfile # Needed to save uploaded file temporarily for textract
+from resume import (
+    _extract_text_from_pdf,
+    _extract_text_from_docx,
+    _extract_text_from_txt,
+    _convert_to_markdown
+)
 
 # --- Configuration and Setup ---
 load_dotenv()
 GOOGLE_API_KEY = os.getenv('GEMINI_API_KEY')
+
 
 # Configure Streamlit page
 st.set_page_config(
@@ -22,59 +27,68 @@ st.set_page_config(
 st.title("📄 Resume AI Assistant")
 st.caption("Upload your resume and chat about it!")
 
+# --- Core Functions ---
+@st.cache_data(show_spinner="Extracting text from resume...")
+def extract_text_to_markdown(uploaded_file):
+    """Extracts text from uploaded file and returns as Markdown"""
+    file_name = uploaded_file.name
+    _, ext = os.path.splitext(file_name)
+    ext = ext.lower()
 
-# --- Core Logic (Adapted from your code) ---
-@st.cache_data(show_spinner="Extracting text from resume...") # Cache the result
-def extract_text_from_file(uploaded_file):
-    """Extracts text from an uploaded file object."""
-    try:
-        # textract needs a filepath, so save the uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            filepath = tmp_file.name
+    if ext == '.pdf':
+        text = _extract_text_from_pdf(uploaded_file)
+    elif ext == '.docx':
+        text = _extract_text_from_docx(uploaded_file)
+    elif ext == '.txt':
+        text = _extract_text_from_txt(uploaded_file)
+    else:
+        raise ValueError(f"Unsupported file format: {ext}")
 
-        # Process the temporary file
-        text_bytes = textract.process(filepath)
-        text = text_bytes.decode("utf-8")
-        os.remove(filepath) # Clean up the temporary file
-        return text
-    except Exception as e:
-        st.error(f"Failed to extract text: {e}")
-        # Try decoding directly for plain text as a fallback
-        try:
-            return uploaded_file.getvalue().decode("utf-8")
-        except Exception:
-            st.error("Could not decode file content as UTF-8 either.")
-            return None # Indicate failure
+    return _convert_to_markdown(text)
 
-# We don't need the review_resume function directly as a *tool* here.
-# Instead, we'll inject the resume context into the general chat prompt.
-
-# Initialize Gemini Model (using cache resource for efficiency)
 @st.cache_resource
-def get_gemini_model():
-    """Initializes and returns the Gemini model client."""
-    # Note: Adjust model name if needed, e.g., "gemini-1.5-pro-latest"
-    # Using "gemini-pro" as a generally available stable model
+def load_model():
+    """Loads the Gemini model"""
     return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-model = get_gemini_model()
 
-# --- Streamlit Session State Initialization ---
+class ChatMemory:
+    """Class to manage conversation history"""
+    def __init__(self, max_messages: int = 10):
+        self.history: List[types.Content] = []
+        self.max_messages = max_messages
+    
+    def add_message(self, role: str, content: str):
+        """Add a message to the history"""
+        self.history.append(
+            types.Content(
+                role=role,
+                parts=[types.Part(text=content)] 
+            )
+        )
+        # Trim history if it exceeds max messages
+        if len(self.history) > self.max_messages:
+            self.history = self.history[-self.max_messages:]
+    
+    def get_history(self) -> List[types.Content]:
+        """Get the conversation history"""
+        return self.history
+    
+    def clear(self):
+        """Clear conversation history"""
+        self.history = []
 
-# Initialize chat history
+ # --- Session State Initialization ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Initialize resume text storage
 if "resume_text" not in st.session_state:
     st.session_state.resume_text = None
 
 if "resume_uploaded" not in st.session_state:
     st.session_state.resume_uploaded = False
 
-# --- Sidebar for File Upload ---
-
+# --- Sidebar ---
 with st.sidebar:
     st.header("Upload Resume")
     uploaded_file = st.file_uploader(
@@ -84,121 +98,123 @@ with st.sidebar:
     )
 
     if uploaded_file is not None:
-        # Process the file only once or if a new file is uploaded
         if not st.session_state.resume_uploaded or st.session_state.get("current_file_name") != uploaded_file.name:
-            extracted_text = extract_text_from_file(uploaded_file)
-            if extracted_text:
-                st.session_state.resume_text = extracted_text
-                st.session_state.resume_uploaded = True
-                st.session_state.current_file_name = uploaded_file.name # Track the current file
-                st.success("✅ Resume processed successfully!")
-                # Optionally add a system message to the chat
-                # st.session_state.messages.append({"role": "assistant", "content": "I have received and processed your resume. How can I help you with it?"})
-            else:
-                st.error("❌ Failed to process the resume file.")
+            try:
+                extracted_text = extract_text_to_markdown(uploaded_file)
+                if extracted_text:
+                    st.session_state.resume_text = extracted_text
+                    st.session_state.resume_uploaded = True
+                    st.session_state.current_file_name = uploaded_file.name
+                    st.success("✅ Resume processed successfully!")
+            except Exception as e:
+                st.error(f"❌ Error processing file: {str(e)}")
                 st.session_state.resume_text = None
                 st.session_state.resume_uploaded = False
                 st.session_state.current_file_name = None
 
     elif st.session_state.resume_uploaded:
-        # If a file was previously uploaded but now none is selected
         st.info("Resume was previously uploaded. Upload a new one to replace it.")
 
     st.markdown("---")
     if st.button("Clear Chat History"):
         st.session_state.messages = []
-        st.session_state.resume_text = None # Also clear resume context on chat clear
+        st.session_state.resume_text = None
         st.session_state.resume_uploaded = False
         st.session_state.current_file_name = None
-        st.rerun() # Rerun the app to reflect changes immediately
-
+        st.rerun()
 
 # --- Main Chat Interface ---
-
-# Display prior chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Get user input
-if prompt := st.chat_input("What would you like to do? (e.g., 'Review my resume', 'Suggest improvements')"):
-    # Add user message to chat history
+if prompt := st.chat_input("What would you like to do?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    # Display user message
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Prepare context for Gemini
-    # Construct the history in the format required by the API (list of Content objects)
-    gemini_history = []
-    system_instruction = "You are a helpful AI assistant." # Base instruction
-
-    # Dynamically add resume context if available
+    # Prepare context
+    context = ""
     if st.session_state.resume_text:
-        system_instruction += (
-            "\n\nThe user has uploaded the following resume. Use this text "
-            "when answering questions about their resume:\n\n"
-            f"--- RESUME START ---\n{st.session_state.resume_text}\n--- RESUME END ---"
-        )
-        # You could also add specific resume analysis instructions here if needed.
-        # e.g., "Focus on identifying key skills, areas for improvement, and tailoring suggestions."
+        context = f"Here is the user's resume:\n\n{st.session_state.resume_text}\n\n"
 
-    # Add system instruction first if it's complex (optional but can be good practice)
-    # Note: For basic gemini-pro, system instructions might be less impactful than prepending context.
-    # For newer models (like 1.5 Pro), the system_instruction parameter is more robust.
-    # Let's prepend context to the user prompt for broader compatibility.
-
-    full_prompt = prompt
-    if st.session_state.resume_text:
-        # Prepend context to the *latest* user message for focus
-         full_prompt = (
-            f"User has provided this resume:\n--- RESUME START ---\n{st.session_state.resume_text}\n--- RESUME END ---\n\n"
-            f"Based on this resume, the user asks: {prompt}"
-        )
-
-
-    # Build the chat history for the API call
-    # The GenAI Python SDK expects a list where user/model roles alternate.
-    # We need to filter/format st.session_state.messages accordingly.
-    api_history = []
-    for msg in st.session_state.messages[:-1]: # Exclude the latest user prompt as it's handled separately
-         # Map role 'assistant' to 'model' for the API
-        api_role = 'model' if msg["role"] == 'assistant' else msg["role"]
-        api_history.append(types.Content(role=api_role, parts=[types.Part(text=msg["content"])]))
-
-
-    # Generate response
     try:
         with st.spinner("Thinking..."):
-            # Start a chat session to send history correctly
-            config = types.GenerateContentConfig(system_instruction=full_prompt)
+            # Start chat with context
+            # chat = model.start_chat(history=[])
             
-            response = model.models.generate_content(
-                
+            # Send both context and prompt
+            # full_prompt = f"{context}User question: {prompt}"
+            # response = chat.send_message(full_prompt)
+            client = load_model()
+
+            memory = ChatMemory(max_messages=20)  # Keep last 20 messages
+
+            memory.add_message("user", content=st.session_state.resume_text)  
+            config = types.GenerateContentConfig(
+        tools=[ 
+
+        ],
+        system_instruction = """**Resume AI Assistant - System Instructions**
+
+                You are an expert resume analyzer and career advisor with the following capabilities:
+
+                1. **Resume Analysis**:
+                - Provide detailed feedback on resume structure, content, and formatting
+                - Identify strengths and areas for improvement
+                - Check for consistency in formatting and styling
+
+                2. **Content Enhancement**:
+                - Suggest powerful action verbs and achievement-oriented language
+                - Help quantify accomplishments with metrics where possible
+                - Recommend relevant keywords for Applicant Tracking Systems (ATS)
+
+                3. **Tailoring Assistance**:
+                - Help customize the resume for specific job descriptions
+                - Suggest relevant skills and experiences to highlight
+                - Provide industry-specific advice when given the target role
+
+                4. **Career Guidance**:
+                - Offer advice on career progression based on the resume
+                - Suggest complementary skills to develop
+                - Provide interview preparation tips for the roles mentioned
+
+                **Interaction Rules**:
+                - Always be professional yet approachable
+                - Ask clarifying questions when needed
+                - Provide concise, actionable advice
+                - Structure responses with clear headings when appropriate
+                - Never share personal opinions - base advice on professional best practices
+                - When suggesting changes, provide specific examples from the resume
+
+                **Response Format**:
+                1. Begin by acknowledging the user's request
+                2. Provide analysis in clear sections
+                3. Use bullet points for actionable items
+                4. Offer to elaborate on any point if needed
+
+                **Special Cases**:
+                - If no resume is uploaded, politely remind the user
+                - If the request is unclear, ask for clarification
+                - If technical terms are used, explain them briefly
+                - Always uses answer briefly expect the users demand that your review their resumes"""
+    )
+
+            memory.add_message("user", prompt)
+
+            response = client.models.generate_content(
                 model="gemini-2.5-pro-exp-03-25",
-                contents = api_history,
-                config= config
-
-                )
+                contents=memory.get_history(),
+                config=config,
+            )
             
-            # chat = model.models (history=api_history)
-            # response = chat.send_message(full_prompt) # Send the potentially context-prepended prompt
-
-            # client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-            # response = client.models.generate_content(prompt)
-
-        # Display assistant response
-        with st.chat_message("assistant"):
-            st.markdown(response.text)
-        # Add assistant response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response.text})
+            # Display response
+            with st.chat_message("assistant"):
+                st.markdown(response.text)
+            st.session_state.messages.append({"role": "assistant", "content": response.text})
 
     except Exception as e:
         st.error(f"An error occurred: {e}")
-        # Optionally remove the last user message if the API call failed significantly
-        # st.session_state.messages.pop()
 
-
-# Add a placeholder if the chat is empty
 if not st.session_state.messages:
-     st.info("Upload your resume using the sidebar and start chatting!")
+    st.info("Upload your resume using the sidebar and start chatting!")
